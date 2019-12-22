@@ -1,6 +1,6 @@
 //
 //  MyHeader.h
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/13.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -55,9 +55,9 @@ using namespace std;
 #define RBRACE "RBRACE"
 
 // 文件路径定义
-#define FILEPATH "/Users/wangshanshan/Desktop/编译技术/编译课设/编译上机/代码生成/解耦合_代码生成/解耦合_代码生成/testfile.txt"
-#define WRITEPATH "/Users/wangshanshan/Desktop/编译技术/编译课设/编译上机/代码生成/解耦合_代码生成/解耦合_代码生成/error.txt"
-#define MIPSPATH "/Users/wangshanshan/Desktop/编译技术/编译课设/编译上机/代码生成/解耦合_代码生成/解耦合_代码生成/mips.txt"
+#define FILEPATH "testfile.txt"
+#define WRITEPATH "error.txt"
+#define MIPSPATH "mips.txt"
 
 // 错误码定义
 // 输出错误类别码方式：字母 'a' + macro
@@ -119,10 +119,17 @@ void isString();
 void return_stat();
 
 string genStrName();
-void genMips();
 
-string getReg();
+void genMips();
+string getReg(string lockMid = "");
 
 void two_elem_assign(string result, string arg1);
-void load_argument(string arg, string reg);
+string load_argument(string arg, string reg, bool unlock = true);
+bool isInteger(string str);
+
+int testFunc(int a, int b);
+
+void storeA1();
+void restoreA1();
+int isPowerOf2(string num);
 #endif /* MyHeader_h */

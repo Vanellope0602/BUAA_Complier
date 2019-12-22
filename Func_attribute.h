@@ -1,6 +1,6 @@
 //
 //  Func_attribute.h
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/15.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -15,7 +15,7 @@ class Func_attribute
 {
    public:
     string Func_name;
-    int func_sp_offset = 0; // 整个函数的常量，变量（包括参数）相对该函数的偏移，初始值为0
+    int func_sp_offset = 4; // 整个函数的常量，变量（包括参数）相对该函数的偏移，初始值为4，用来存 $ra
     int return_type; // 0 = void, 1 = int, 2 = char
     // 参数列表<para_name, para_type>, 要按顺序，所以用vector
     vector<pair<string, string>> para_table;
@@ -47,6 +47,7 @@ class Func_attribute
     
     void allocVarAddr(string name, int size);
     int getFuncSpOffset();
+    int findArgumentPos(string name);
 };
 
 #endif /* Func_attribute_h */

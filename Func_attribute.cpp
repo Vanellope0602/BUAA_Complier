@@ -1,6 +1,6 @@
 //
 //  Func_attribute.cpp
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/19.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -56,14 +56,24 @@ void Func_attribute::addVars(string type, string name, int arr_size = 0) { // �
 }
 
 void Func_attribute::allocVarAddr(string name, int size = 0) {
-    if (size == 0 || size == 1) {
-        func_sp_offset -= 4;
+    int prev_sp_plus4 = func_sp_offset+4;
+    if (size == 0 || size == 1) {   // 栈是向上增长的
+        func_sp_offset += 4;
     } else {
-        func_sp_offset = func_sp_offset - 4*size;
+        func_sp_offset = func_sp_offset + 4*size;
     }
-    vars_addr.insert(make_pair(name, func_sp_offset));
+    // 要把数组头地址放在最下面
+    vars_addr.insert(make_pair(name, prev_sp_plus4));
 }
 
 int Func_attribute::getFuncSpOffset() {
     return func_sp_offset;  // func_sp_offset 是该函数实时的最大（最后一个变量）的相对偏移量
+}
+
+// 这个函数用于找参数
+int Func_attribute::findArgumentPos(string name){
+    if (para_name.count(name) == 1) {   // 有这个参数
+        return 1;
+    }
+    else return 0;
 }

@@ -1,6 +1,8 @@
 # BUAA_Complier
 The compiler lab of BUAA (2019 Autumn)
 
+
+
 ###词法分析
 - getSym()函数
 
@@ -17,4 +19,5 @@ The compiler lab of BUAA (2019 Autumn)
 - 行为应当与 clang8.0.0 编译器行为相同
 
 ###代码优化
-- 尚未完成
+
+- 详情见申优文档

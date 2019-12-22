@@ -1,6 +1,6 @@
 //
 //  Generate_mid_code.cpp
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/14.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -26,7 +26,7 @@ void outputMid(midCode item){ // 生成四元式存到一个容器或者文件�
 // while_2_begin, while_2_end
 // do_3_begin, do_3_end
 // if_3_else, if_3_end
-// 四元式构造器, type = 1, 4, 5, 6
+// 四元式构造器, type = 1, 4, 5, 6, type = 9 失效并直接略过
 midCode::midCode(int type, string result, string arg1, string op, string arg2) {
     this->type = type;
     this->result = result;
@@ -78,7 +78,7 @@ pair<string, string> genLabel(string type){
     } else if (type == IF) {
         newLabelHead = newLabelHead + "if_" + to_string(label_t) + "_else:"; // 不满足条件则跳转到这里
         newLabelTail = newLabelTail + "if_" + to_string(label_t) + "_end:";  // 满足条件执行完跳到这里
-    } else if (type == FUNC) {
+    } else if (type == FUNC) { // 这个根本没用到
         newLabelHead = newLabelHead + "func_" + to_string(label_t) + "_begin:";
         newLabelTail = newLabelTail + "func_" + to_string(label_t) + "_end:";
     } else {
@@ -87,7 +87,7 @@ pair<string, string> genLabel(string type){
     return make_pair(newLabelHead, newLabelTail);
 }
 
-string genTempReg(){    // t1, t2, t3, t4 ...返回一个临时中间变量名
+string genTempReg(){    // t1, t2, t3, t4 ...返回一个临时中间变量名,无限递增
     last_temp_reg = cur_temp_reg;
     string tempReg = "#t";
     temp_t++;
@@ -98,11 +98,14 @@ string genTempReg(){    // t1, t2, t3, t4 ...返回一个临时中间变量名
 // 打印中间语句 连接功能测试成功
 void printMid() {
     for (int i = 0; i < midCodeContainer.size(); i++) {
-        cout << "type = " << midCodeContainer[i].type << ", ";
-        cout << midCodeContainer[i].result << " ";
-        cout << midCodeContainer[i].arg1 << " ";
-        cout << midCodeContainer[i].op << " ";
-        cout << midCodeContainer[i].arg2 << endl;
+        if (midCodeContainer[i].type != 9) {
+            cout << "type = " << midCodeContainer[i].type << ", ";
+            cout << midCodeContainer[i].result << " ";
+            cout << midCodeContainer[i].arg1 << " ";
+            cout << midCodeContainer[i].op << " ";
+            cout << midCodeContainer[i].arg2 << endl;
+        }
+       
     }
 }
 
@@ -118,4 +121,10 @@ int midCodeSize() {
 }
 midCode getNextMidCode(int i){
     return midCodeContainer[i];
+}
+
+void modifyMidCode(midCode code, int pos) {
+    midCodeContainer[pos] = code;
+    cout << "修改midCode ，result : " << code.result << ", arg1: " << code.arg1
+     << ", op: " << code.op << ", arg2: "<< code.arg2 << endl;
 }

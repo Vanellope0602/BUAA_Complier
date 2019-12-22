@@ -1,6 +1,6 @@
 //
 //  main.cpp
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/13.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -35,9 +35,14 @@ map<string, char> global_char_cons_value; // <cons_name, char Value>
 map<string, pair<string, int>> global_vars; // 全局变量名字，有可能是数组，size默认是0(非数组)
 vector<string> global_vars_mips_data; // 全局变量放 mips .data标签
 
-int regNo = 9; // t1, t2($10), t3($11)
-int Regs[32]; // 寄存器组，1代表已经占用，0代表没有被占用
-
+int sregNo = 0; // 需要保存的寄存器分配，s0-s7
+int tregNo = 0; // 临时寄存器分配, t0 - t9
+int saveRegisterGroup[8]; // s0-s7寄存器组，1 代表占用锁定，0代表可以用 getReg 分配一个过去
+map<string, int> lockedRegMap; // 标志 <var_name, regNo> 该变量是否分配了一个s寄存器
+// 由于s寄存器涉及解锁问题，所以存的是寄存器号，方便字符串拼接
+int tmpRegisterGroup[10];   // t0-t9
+map<string, string> concludeVarMap;    // <var_name, regName> （目前只用来存归纳变量,原则上不超过5个）
+// 这个 t 寄存器自始至终都可以用，不用释放，直接存寄存器名字
 ofstream outfile;
 ifstream infile;
 ofstream outmips;
@@ -52,7 +57,7 @@ int cur_exp_type = 0; // 用于标记当前表达式的类型，0 暂无，1 int
 int cur_int_con = 0; // 标记当前读进来的无符号整数
 bool have_return_stat = false; // 用于标记当前局域是否出现了 return(***) 语句,"return;"不算，每次新函数定义时设置为 F
 bool arr_be_assigned = false;   // 赋值语句是否是数组元素被赋值
-string buffer[100000];
+string buffer[500000];
 int buf_pointer = 0; // 用来标记缓冲区到了哪里
 // 错误处理相关全局参数
 int last_sym_line = 1; // 缺分号应该报在应该有分号的那一行
@@ -62,6 +67,7 @@ string getSym();    // 返回类别符的词法分析函数
 // 添加有关函数属性的时候，直接调用它自己的函数就可以了，找到对应的函数内区域 全局function_name即可
 
 map<string, Func_attribute> Func_attr;
+
 
 int main() {
     infile.open(FILEPATH, ios::binary);
@@ -73,12 +79,13 @@ int main() {
     infile.close();
     outfile.close();
     
-    // label pair 测试成功
     printMid();
     genMips();
     
     return 0;
 }
+
+
 
 bool can_follow_idenfr(char ch) {
     if (ch == '{' || ch == '=' || ch == '!' || ch == '[' || ch == ']'
@@ -228,6 +235,7 @@ int checkIdenfrDef(string type, string name, bool is_var, int size = 0) {
     }
     return 0; // 不是检查未定义的，外层也不用取返回值
 }
+
 string getSym() {
     last_sym_line = curLine;
     char ch;
@@ -1209,7 +1217,8 @@ void cir_stat() {   // 循环语句
             midCode mid3(8, labels.second);
             outputMid(mid3);
         }
-    } else if (sym == DOTK) {
+    }
+    else if (sym == DOTK) {
         pair<string, string> labels = genLabel("do");
         midCode mid(8, labels.first);
         outputMid(mid);
@@ -1235,9 +1244,10 @@ void cir_stat() {   // 循环语句
         }
         midCode mid2(8, labels.second);
         outputMid(mid2); // 这个放不放都无所谓
-    } else if (sym == FORTK) {
+    }
+    else if (sym == FORTK) {
         // for'('<标识符>＝<表达式>;<条件>;<标识符>＝<标识符>(+|-)<步长>')'<语句>
-        string tmp_idenfr;
+        string tmp_idenfr;  // 记下，与后面比较是不是归纳变量
         pair<string, string> labels = genLabel("for");
         sym = getSym();
         if (sym == LPARENT) {
@@ -1248,14 +1258,14 @@ void cir_stat() {   // 循环语句
                 sym = getSym();
             }
         }
-        if (sym == ASSIGN) {
+        if (sym == ASSIGN) {    // 第一条赋值
             sym = getSym();
             string tmp_exp = express();
             // 生成第一条中间代码
             midCode mid(2, tmp_idenfr, tmp_exp);
             outputMid(mid);
         }
-        if (sym == SEMICN) {    // 分号
+        if (sym == SEMICN) {    // 分号，中间的条件
             sym = getSym();
             midCode mid(8, labels.first); // for_1_begin:
             outputMid(mid);
@@ -1292,7 +1302,7 @@ void cir_stat() {   // 循环语句
             sym = getSym();
         }
         string op; // 这个 op 正确文法下一定会被初始化
-        string step;
+        string step;  // 步长这里会有归纳变量，归纳变量可以考虑不要存到内存里
         if (sym == PLUS || sym == MINU) {
             op = (sym == PLUS)? "+" : "-";
             sym = getSym();
@@ -1307,12 +1317,29 @@ void cir_stat() {   // 循环语句
                 statement();
             }
         }
+        if (concludeVarMap.size() <= 4 ) { // 归纳变量最多只能占用5个
+            // 如果两个归纳变量相同，存到 concludeVarMap, tregNo 从0开始的
+            if (concludeVarMap.count(conclude_var1) == 0
+                && Func_attr[curFunc].findArgumentPos(conclude_var1) == 0) { // 没有这个名字，那么加进去分配
+                string regName = "$t" + to_string(tregNo);
+                tmpRegisterGroup[tregNo] = 1;   // 直接分配临时寄存器
+                concludeVarMap.insert(make_pair(conclude_var1, regName));
+                tregNo++;
+            }
+            if (concludeVarMap.count(conclude_var2) == 0
+                && Func_attr[curFunc].findArgumentPos(conclude_var2) == 0) { // 是归纳变量且本函数里没有叫这个名字的参数
+                string regName = "$t" + to_string(tregNo);
+                tmpRegisterGroup[tregNo] = 1;   // 直接分配临时寄存器
+                concludeVarMap.insert(make_pair(conclude_var2, regName));
+                tregNo++;
+            }
+        }
+        
         // 给归纳变量最后一步生成midCode , BNZ 满足条件则跳转回 begin label
-        midCode mid(1, genTempReg(), conclude_var2, op, step);
-        Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
+        // 12.8 修改：这里不用分两步走
+        midCode mid(1, conclude_var1, conclude_var2, op, step);
         outputMid(mid);
-        midCode mid1(2, conclude_var1, getCurTempReg()); // 最终结果赋值
-        outputMid(mid1);
+
         midCode mid2(2, "goto", labels.first);
         outputMid(mid2);
         midCode mid3(8, labels.second);
@@ -1489,20 +1516,66 @@ string express() {    // <表达式> 注意：2*('a'); 'a'*'b'这种都算 int �
     }
     // 这里应该是从左到右加！
     // t1 = arg[0] + arg[1] 中间代码
+    int needMid = 0;
+    int tmpInteger = 0;     // 用于常数优化
+    
     if (args.size() >= 2) {
-        midCode mid(1, genTempReg(), args[0], ops.front(), args[1]);
-        Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
-        ops.pop(); // 弹出
-        outputMid(mid);
-        // t2 = t1 + args[2], t3 = t2 + args[3]
-        for (int i = 2; i < args.size(); i++) {
-            midCode mid(1, genTempReg(), getLastTempReg(), ops.front(), args[i]);
+        if (isInteger(args[0]) && isInteger(args[1])) { // 常数计算，不输出中间代码
+            int tmp0 = stoi(args[0]) , tmp1 = stoi(args[1]);
+            if (ops.front() == "+") {
+                tmpInteger = tmp0 + tmp1;
+            } else if (ops.front() == "-") {
+                tmpInteger = tmp0 - tmp1;
+            } else if (ops.front() == "*") {
+                tmpInteger = tmp0 * tmp1;
+            } else if (ops.front() == "/") {
+                tmpInteger = tmp0 / tmp1;
+            }
+            ops.pop(); // 弹出一个符号
+        } else {
+            needMid++;
+            midCode mid(1, genTempReg(), args[0], ops.front(), args[1]);
             Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
-            ops.pop();
+            ops.pop(); // 弹出
             outputMid(mid);
         }
-        ret_exp = getCurTempReg(); // 要返回的应该是当前最新的中间临时变量（寄存器值）
-    } else { // 没有后续的运算符，只有一个 item
+        
+        for (int i = 2; i < args.size(); i++) {
+            if (needMid == 0) {
+                if (isInteger(args[i])) { // 下一个要计算的还是常数
+                    int tmpi = stoi(args[i]);
+                    if (ops.front() == "+") {
+                        tmpInteger = tmpInteger + tmpi;
+                    } else if (ops.front() == "-") {
+                        tmpInteger = tmpInteger - tmpi;
+                    } else if (ops.front() == "*") {
+                        tmpInteger = tmpInteger * tmpi;
+                    } else if (ops.front() == "/") {
+                        tmpInteger = tmpInteger / tmpi;
+                    }  // 不用输出中间代码
+                } else {    // 第一次遇见下一个计算的不是常数
+                    needMid++;
+                    string integer = to_string(tmpInteger);
+                    midCode mid(1, genTempReg(), integer, ops.front(), args[i]);
+                    Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
+                    outputMid(mid);
+                }
+                ops.pop();
+            } else {
+                needMid++;  // 后面应该也不会再用到了
+                midCode mid(1, genTempReg(), getLastTempReg(), ops.front(), args[i]);
+                Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
+                ops.pop();
+                outputMid(mid);
+            }
+        }
+        
+        if (needMid == 0) {
+            ret_exp = to_string(tmpInteger);
+        } else {
+            ret_exp = getCurTempReg(); // 要返回的应该是当前最新的中间临时变量（寄存器值）
+        }
+    } else { // 没有后续的运算符，该表达式只有一个项，那直接返回这个项就行了
         ret_exp = args[0];
     }
     
@@ -1531,21 +1604,65 @@ string item() {  // <项>
         cur_exp_type = 1;
     }
     // 如果没有进入 while 循环，返回的字符串就是 factor 返回的东西, 可能是单个数字，名字，或者 #tx
+    int needMid = 0;
+    int tmpInteger = 0;     // 用于常数优化
     if (args.size() >= 2) {
-        midCode mid(1, genTempReg(), args[0], ops.front(), args[1]);
-        Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
-        ops.pop(); // 弹出
-        outputMid(mid);
-        // t2 = args[n-3] + t1 ..., t3 = args[n-4] + t2
-        for (int i = 2; i < args.size(); i++) {
-            midCode mid(1, genTempReg(), getLastTempReg(), ops.front(), args[i]);
+        if (isInteger(args[0]) && isInteger(args[1])) { // 常数计算，不输出中间代码
+            int tmp0 = stoi(args[0]) , tmp1 = stoi(args[1]);
+            if (ops.front() == "+") {
+                tmpInteger = tmp0 + tmp1;
+            } else if (ops.front() == "-") {
+                tmpInteger = tmp0 - tmp1;
+            } else if (ops.front() == "*") {
+                tmpInteger = tmp0 * tmp1;
+            } else if (ops.front() == "/") {
+                tmpInteger = tmp0 / tmp1;
+            }
+            ops.pop(); // 弹出一个符号
+        } else {
+            needMid++;
+            midCode mid(1, genTempReg(), args[0], ops.front(), args[1]);
             Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
-            ops.pop();
+            ops.pop(); // 弹出
             outputMid(mid);
         }
-        ret_item = getCurTempReg(); // 要返回的应该是当前最新的中间临时变量（寄存器值）
+        // t2 = args[n-3] + t1 ..., t3 = args[n-4] + t2
+        for (int i = 2; i < args.size(); i++) {
+            if (needMid == 0) {
+                if (isInteger(args[i])) { // 下一个要计算的还是常数
+                    int tmpi = stoi(args[i]);
+                    if (ops.front() == "+") {
+                        tmpInteger = tmpInteger + tmpi;
+                    } else if (ops.front() == "-") {
+                        tmpInteger = tmpInteger - tmpi;
+                    } else if (ops.front() == "*") {
+                        tmpInteger = tmpInteger * tmpi;
+                    } else if (ops.front() == "/") {
+                        tmpInteger = tmpInteger / tmpi;
+                    }
+                } else {    // 第一次遇到下一个计算的不是 integer 而是变量的名字了，又不能用lastTempReg
+                    needMid++;
+                    string integer = to_string(tmpInteger);
+                    midCode mid(1, genTempReg(), integer, ops.front(), args[i]);
+                    Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
+                    outputMid(mid);
+                }
+                ops.pop();  // 最后弹出一个符号
+            } else {
+                needMid++;
+                midCode mid(1, genTempReg(), getLastTempReg(), ops.front(), args[i]);
+                Func_attr[curFunc].allocVarAddr(getCurTempReg(), 0);
+                ops.pop();
+                outputMid(mid);
+            }
+        }
+        if (needMid == 0) {
+            ret_item = to_string(tmpInteger);   // 从头到尾都只有常数计算
+        } else {
+            ret_item = getCurTempReg(); // 要返回的应该是当前最新的中间临时变量（寄存器值）
+        }
     }
-    else { // 没有后续的运算符，只有一个 item
+    else { // 没有后续的运算符，该项只有一个因子
         ret_item = args[0];
     }
 
@@ -1625,7 +1742,8 @@ string factor() {  // <因子>, **这一层决定这个表达式到底是 int �
             printf("Line %d : (表达式) 后缺少 ')'\n", curLine);
             error(should_have_rparent);
         }
-    } else if (sym == PLUS || sym == MINU || sym == INTCON) { // 整数
+    }
+    else if (sym == PLUS || sym == MINU || sym == INTCON) { // 整数
         cout << sym << endl;
         cur_exp_type = 1;
         if(!integer()) {
@@ -1846,6 +1964,7 @@ string genStrName(){
     //cout << "gen str name " << strName << endl;
     return strName;
 }
+
 void genMips(){
     outmips.open(MIPSPATH, ios::trunc); // 以写模式打开文件
     outmips << ".data" << endl; // 数据段
@@ -1855,12 +1974,7 @@ void genMips(){
         cout << "全局变量 .data 定义 " << endl;
         outmips << global_vars_mips_data[i] << endl;
     }
-    map<string, Func_attribute>::iterator it;
-    for(it = Func_attr.begin(); it != Func_attr.end(); it++){ // map迭代,给函数名分一个位置,存对应$gp的偏移位置
-        outmips << it->first << ": .space 4" << endl; // add: .space 4
-    }
-    outmips << "curFuncOffset: .space 4" << endl; // 这个地址用来存mips跳到某个函数时，这个函数的总体偏移
-    
+   
     outmips << "enter: .asciiz \"\\n\"" << endl; // 换行时调用这个名字
     string str_tmp_name;
     for (int i = 1; i <= strNum; i++) {
@@ -1871,114 +1985,93 @@ void genMips(){
     
     outmips << ".text" << endl; // 代码段
     
-    // 再遍历一遍Func_attr, 在mips中把每个函数对应$gp的偏移位置存进去
-    map<string, Func_attribute>::iterator it2;
-    int loop = 1; // 4($gp), 8($gp)
-    for(it2 = Func_attr.begin(); it2 != Func_attr.end(); it2++) {
-        string funcName = it2->first; // 函数名就是地址里对应的一个 label
-        string tx = getReg();
-        outmips << "li " << tx << ", " << 4*loop << endl; // 第几次loop函数偏移量就是多少，相对于 gp 是固定的
-        outmips << "sw " << tx << ", " << funcName << endl; // 4*x偏移量存到全局标签里
-        outmips << "li " << tx << ", " << it2->second.getFuncSpOffset() << endl;
-        outmips << "sw " << tx << ", " << 4*loop << "($gp)" << endl; // 该函数offset存到gp上面
-        loop++;
-    }
     outmips << "j main_" << endl; // 一开始先进入main函数
     int size = midCodeSize();
     int p = 0; // 开始一条一条读中间代码
+    
+    bool inForLoop = false;
     while (p < size) {
         map<string, int> int_cons_value = Func_attr[curFunc].int_cons_value;
         map<string, char> char_cons_value = Func_attr[curFunc].char_cons_value;
         map<string, int> vars_addr = Func_attr[curFunc].vars_addr;
+        Func_attribute func_attr = Func_attr[curFunc];
         // 生成mips使用的是临时的 map ，因为cons值固定，不需要再修改，而vars_addr也是固定的
         midCode code = getNextMidCode(p);
         string op = code.op;
         string arg1 = code.arg1;
         string arg2 = code.arg2;
-        string result = code.result; // #t1, n[i], 其他关键字？
+        string result = code.result; // #t1, n[i], 其他关键字
         if (code.type == 1) { // 标准表达式赋值，四元式, result
-            if(result[0] == '#') { // #t1 , a + 1, #t2 = -9 + con, 这里不会出现数组形式的东西
-                int result_addr = vars_addr[result]; // 取出临时给中间变量分配的地址
-                int num1, num2, addr1 = 0, addr2 = 0;
-                string reg1 = getReg(), reg2 = getReg(), reg3 = getReg();
-                // lw arg1, lw arg2, op target, arg1, arg2; sw target , addr($sp)
-                if (arg1[0] == '+' || arg1[0] == '-' || isdigit(arg1[0])){
-                    num1 = stoi(arg1); // mips 往寄存器里装 // li $9, num1
-                    outmips << "li " << reg1 << " , " << num1 << endl;
+            if(result[0] == '#' || isalpha(result[0])) { // #t1 , a + 1, i=i+1 这里不会出现数组形式的东西
+                int result_addr = vars_addr[result]; // 取出临时给(中间)变量分配的地址
+                bool shouldGoMem = false;
+                string reg3; // 用来存结果
+                if (result[0] == '#') {
+                    reg3 = getReg(result);  // lock <#s1, 2> 意为 #s2 与 2号寄存器绑定，后面无需 sw
                 }
-                else if (arg1[0] == '\'') { // 是字符常量参与计算！！！
-                    char ch = arg1[1];
-                    int ascii = ch;
-                    cout << "arg1 是 char 参与计算" << endl;
-                    outmips << "li " << reg1 << ", " << ascii << endl;
+                else if (concludeVarMap.count(result) == 1 && func_attr.findArgumentPos(result) == 0) {
+                    reg3 = concludeVarMap[result];  // 归纳变量
                 }
-                else { // 取（中间）变量地址获得值 ，注意，有可能是全局变量或者函数/全局常量
-                    if (int_cons_value.count(arg1) == 1) { // 是函数内int常量// li $reg1, 这个数
-                        outmips << "li " << reg1 << ", " << int_cons_value[arg1] << endl;
-                    } else if (char_cons_value.count(arg1) == 1) { // 函数内 char 常量，暂不考虑
-                        int ascii = char_cons_value[arg1];  // 应该把字符换成 ASCII 码
-                        outmips << "li " << reg1 << ", " << ascii << endl;
-                    } else if (vars_addr.count(arg1) == 1) { // 先考虑函数内变量，包含#t中间变量
-                        addr1 = vars_addr[arg1]; // lw $10, sp_offset($sp)
-                        outmips << "lw " << reg1 << " , " << addr1 << "($sp)" << endl;
-                    } else if (global_int_cons_value.count(arg1) == 1) { // 然后再考虑全局常量
-                        outmips << "li " << reg1 << ", " << global_int_cons_value[arg1] << endl;
-                    } else if (global_char_cons_value.count(arg1) == 1) {
-                        int ascii = global_char_cons_value[arg1];
-                        outmips << "li " << reg1 << ", " << ascii << endl;
-                    } else if(global_vars.count(arg1)) { // 全局变量表里找到这个名字
-                        outmips << "lw " << reg1 << " , " << arg1 << endl; // 直接用名字当地址
-                    }
-                    else { // 找不到，报错
-                        cout << "生成mips过程中arg1找不到改变量或常量，没有分配地址" << arg1 << endl;
-                    }
-                    // 三目运算reg1装载完毕
+                else {
+                    shouldGoMem = true;
+                    reg3 = getReg();
                 }
-                // 开始装载reg2
-                if (arg2[0] == '+' || arg2[0] == '-' || isdigit(arg2[0])) {
-                    num2 = stoi(arg2);
-                    outmips << "li " << reg2 << ", " << num2 << endl;
-                } else if (arg2[0] == '\'') { // 字符常量参与计算！
-                    char ch = arg2[1];
-                    int ascii = ch;
-                    cout << "arg2 是 char 参与计算" << endl;
-                    outmips << "li " << reg2 << ", " << ascii << endl;
+                string reg1 = getReg(), reg2 = getReg();
+                bool reg1_isInt = false, reg2_isInt = false;
+                int int1 = 0, int2 = 0;
+                if (isInteger(arg1) && !isInteger(arg2) && op == "+") {
+                    reg1_isInt = true;
+                    int1 = stoi(arg1);
+                    reg2 = load_argument(arg2, reg2);
+                } else if (isInteger(arg2) && !isInteger(arg1) && op == "+") { // 大多数是这种情况
+                    reg2_isInt = true;
+                    int2 = stoi(arg2);
+                    reg1 = load_argument(arg1, reg1);
+                } else if (isInteger(arg2) && !isInteger(arg1) && op == "-") {
+                    reg2_isInt = true;
+                    int2 = stoi(arg2);
+                    reg1 = load_argument(arg1, reg1);
                 }
-                else { // 取（中间）变量地址获得值 ，注意，有可能是全局变量或者函数/全局常量
-                    if (int_cons_value.count(arg2) == 1) { // 是函数内int常量// li $reg1, 这个数
-                        outmips << "li " << reg2 << ", " << int_cons_value[arg2] << endl;
-                    } else if (char_cons_value.count(arg2) == 1) { // 函数内 char 常量，暂不考虑
-                        int ascii = char_cons_value[arg2];  // 应该把字符换成 ASCII 码
-                        outmips << "li " << reg2 << ", " << ascii << endl;
-                    } else if (vars_addr.count(arg2) == 1) { // 先考虑函数内变量
-                        addr2 = vars_addr[arg2]; // lw $10, sp_offset($sp)
-                        outmips << "lw " << reg2 << " , " << addr2 << "($sp)" << endl;
-                    } else if (global_int_cons_value.count(arg2) == 1) { // 然后再考虑全局int常量
-                        outmips << "li " << reg2 << ", " << global_int_cons_value[arg2] << endl;
-                    } else if (global_char_cons_value.count(arg2) == 1) { // 全局 char常量
-                        int ascii = global_char_cons_value[arg2];
-                        outmips << "li " << reg2 << ", " << ascii << endl;
-                    } else if (global_vars.count(arg2) == 1) { // 全局变量, 名字当地址
-                        outmips << "lw " << reg2 << " , " << arg2 << endl;
-                    }
-                    else { // 找不到，报错
-                        cout << "生成mips过程中arg2找不到改变量或常量，没有分配地址 " << arg2 << endl;
-                        cout << "当前midCode " << result << " " << arg1 << " "<< op << " " << arg2 << endl;
-                    }
-                    //三目运算 reg2装载完毕
+                else {
+                    reg1 = load_argument(arg1, reg1); // 如果arg1是中间变量存过，那么返回已经存有值的那个寄存器，
+                    reg2 = load_argument(arg2, reg2);
                 }
                 if (op == "+") { // add $t1, $t2, $t3; sw $t3, -400($sp)
-                    outmips << "add " << reg3 << "," << reg1 << ", " << reg2 << endl;
-                    outmips << "sw " << reg3 << ", " << result_addr << "($sp)" << endl;
-                } else if (op == "-") {
-                    outmips << "sub " << reg3 << "," << reg1 << ", " << reg2 << endl;
-                    outmips << "sw " << reg3 << ", " << result_addr << "($sp)" << endl;
-                } else if (op == "*") {
-                    outmips << "mul " << reg3 << "," << reg1 << ", " << reg2 << endl;
-                    outmips << "sw " << reg3 << ", " << result_addr << "($sp)" << endl;
-                } else if (op == "/") {
-                    outmips << "div " << reg1 << ", " << reg2 << endl;
-                    outmips << "mflo " << reg3 << endl;
+                    if (reg1_isInt) { // xxx = 2 + xxx
+                        outmips << "addi " << reg3 << "," << reg2 << ", " << int1 << endl;
+                    } else if (reg2_isInt) {
+                        outmips << "addi " << reg3 << "," << reg1 << ", " << int2 << endl;
+                    } else {
+                        outmips << "add " << reg3 << "," << reg1 << ", " << reg2 << endl;
+                    }
+                }
+                else if (op == "-") {
+                    if (reg2_isInt) { // i = i - 1, addi reg3, reg1, -int2,  加后面常数的相反数
+                        outmips << "addi " << reg3 << "," << reg1 << ", " << -int2 << endl;
+                    } else {
+                        outmips << "sub " << reg3 << "," << reg1 << ", " << reg2 << endl;
+                    }
+                }
+                else if (op == "*") { // m = n * 2, n*4, n*8, 4*n
+                    if (isInteger(arg2) && !isInteger(arg1) && isPowerOf2(arg2) != 0) {
+                        outmips << "sll " << reg3 << "," << reg1 << ", " << isPowerOf2(arg2) << endl;
+                    } else if (isInteger(arg1) && !isInteger(arg2) && isPowerOf2(arg1) != 0) {
+                        outmips << "sll " << reg3 << "," << reg2 << ", " << isPowerOf2(arg1) << endl;
+                    } else {
+                        outmips << "mul " << reg3 << "," << reg1 << ", " << reg2 << endl;
+                    }
+                    
+                }
+                else if (op == "/") { // xxx = x / 2
+                    if (isInteger(arg2) && !isInteger(arg1) && isPowerOf2(arg2) != 0) {
+                        outmips << "srl " << reg3 << "," << reg1 << ", " << isPowerOf2(arg2) << endl;
+                    } else {
+                        outmips << "div " << reg1 << ", " << reg2 << endl;
+                        outmips << "mflo " << reg3 << endl;
+                    }
+                }
+                
+                if (shouldGoMem) {
                     outmips << "sw " << reg3 << ", " << result_addr << "($sp)" << endl;
                 }
             } else {
@@ -1986,107 +2079,79 @@ void genMips(){
             }
         }
         else if (code.type == 2) { // 二元，赋值中含有数组元素，最终结果赋值
-            // 11.18中午下午写，被赋值，store word, result = #tx, idenfr,id[];被赋值的不可能是常量，直接用vars_addr
-            // arg1 = #ti 或者 idenfr, id[0],数字, 可能是常量！！！
-            // #t6  = z[1], z[2] = 12，z[1] = num， y = #t2 ,x = y, i = 0, i = 'i'
-            if (result == "goto") { // 跳转到的标签先去掉末尾的冒号
+            if (result == "goto") { // 跳转到的标签先去掉末尾的冒号 size()-1
                 outmips << "j " << arg1.substr(0, arg1.size()-1) << endl; // jump unconditionally label
             }
             else if (result == "int" || result == "char" || result == "void"){ // 函数头
-                // arg1 是函数名, 此时进来的时候 $sp 已经移动过了，$ra 已经在 Mars中自动写入了
                 string call_func_name = arg1;
-                outmips << call_func_name << "_:" << endl; // 输出函数标签的时候名字后面加一个下划线避免与全局标签重名
-                // 开始存调用这个函数的准备东西，4($sp), 0($sp)是上一个函数的东西，关于当前-4,-8...($sp)参数已经存好
-                outmips << "sw $ra, 4($sp)" << endl;
-                string curFunc_offset_reg = getReg();
-                outmips << "lw " << curFunc_offset_reg << ", curFuncOffset" << endl;
-                outmips << "addi " << curFunc_offset_reg << ", " << curFunc_offset_reg << ", -8" << endl;
-                outmips << "sw " << curFunc_offset_reg << ", 0($sp)" << endl;
-                // 上一个函数的整体偏移-8 存到 0($sp)中，对于main来说，没有上一个函数，所以存了也不会用
-                // 下面要更改新的 curFuncOffset,以便下一次调用别的时候这里可以取出被调用函数调用别人应该偏移多少
-                string tmp = getReg(), tmp2 = getReg();
-                outmips << "lw " << tmp << ", " << call_func_name << endl; // 该函数相对 gp 的偏移
-                outmips << "add " << tmp << ", " << tmp << ", $gp" << endl; // 得到地址
-                outmips << "lw " << tmp2 << ", 0(" << tmp << ")" << endl; // 得到该函数总体偏移
-                outmips << "sw " << tmp2 << ", curFuncOffset" << endl; // 更新当前函数总体偏移
-                // debug: curFuncOffset没有及时恢复，应该在jr $ra之前恢复
-                curFunc = call_func_name; // 更新 curFunc,注意，读中间代码的时候仅在这里更新 curFunc
-                // 那么后面语句的变量偏移都是相对这个 curFunc的 vars_addr 的
+                curFunc = call_func_name; // 读中间代码的时候仅在这里更新 curFunc
+                outmips << call_func_name << "_:" << endl;
+                // 进到这个函数的时候，先把 sp 向下移动整个函数的 offset
+                // 第一个4位已经预留给 $ra
+                int func_sp_offset = Func_attr[call_func_name].getFuncSpOffset();
+                
+                outmips << "addi $sp, $sp, -" << func_sp_offset+52 << endl;
+                // 向下移动这个函数的符号表大小，其中52位是用来存到栈的
+                // 0($sp)是上一一个函数内 jal 的时候 mips 自动存到了$ra里
+                outmips << "sw $ra, 0($sp)" << endl;
             }
             else if (result == "push") { // 调用函数前，压栈传参，并不知道调用的是那个，所以只能先
                 // arg1 是当前函数的（中间）变量名？局部常量名/全局变量名/全局常量名/整数/字符
                 push_vector.push_back(arg1);
                 // 如果这是全局变量，后面的 push 如果是函数调用可能会导致前面参数的变量名代表的数改变
-            } else if (result == "call") { // jal function_name, 要判断一下函数是不是 void
+            }
+            else if (result == "call") { // jal function_name, 要判断一下函数是不是 void
+                storeA1();
+                
                 string target_function = arg1; // 目标函数名
                 map<string, int> target_vars_addr = Func_attr[target_function].vars_addr;
                 vector<pair<string, string>> para_table = Func_attr[target_function].para_table;
-                //cout << "目标调用函数 " << target_function << " 规定参数个数 ：" << para_table.size() << endl;
-                // 把 push_vector 里的东西一个个存到 target_function 对应参数的地址
-                string curFunc_offset_reg = getReg();
-                outmips << "lw " << curFunc_offset_reg << ", curFuncOffset" << endl;
-                outmips << "addi " << curFunc_offset_reg << ", " << curFunc_offset_reg << ", -8" << endl;
-                outmips << "add "<< curFunc_offset_reg<< ", "<< curFunc_offset_reg<<", $sp" << endl;
-                // 此时 curFunc_offset_reg 存着新移动后的 $sp ，（$sp还未真正移动）
+                int tar_sp_offset = Func_attr[target_function].getFuncSpOffset();
+                string target_sp = getReg();
+                
+                outmips << "addi " << target_sp << ", $sp , -" << tar_sp_offset+52 << endl;
+                // 此时 target_sp 存着新移动后的 $sp ，（$sp还未真正移动）
+                
+                // 每次 $sp 移动的时候是要多移动 52 留给 $s0-$s7 和临时 t 来存的
                 int push_size = push_vector.size();
                 for (int i = 0; i < para_table.size(); i++) { // para_table 和 push vector 应该一样大
-                    // 取出一个实参的相对位置, 应该倒过来存！取push_vector的最后 para_table.size()个
-                    string load_para_reg = getReg(); // 先存最后一个，倒数第二个
-                    load_argument(push_vector[push_size-para_table.size()+i], load_para_reg);
-                    // 现在参数的值已经存到 load_para_reg 里
+                    string load_para_reg = getReg();
+                    load_para_reg = load_argument(push_vector[push_size-para_table.size()+i], load_para_reg);
+                    
                     string para_name = para_table[i].first; // 第 i 个参数的名字
                     int para_offset = target_vars_addr[para_name]; // 获得第i个参数相对于它自己函数的偏移量
-                    cout << "第 " << i << " 个形式参数相对于自身函数的偏移量 " << para_offset << " " << push_vector[push_size-para_table.size()+i]<< endl;
-                    // 此时 para_offset 即相对 curFunc_offset_reg 的偏移量，存load_para_reg过去
-                    // sw load_para_reg, para_offset($curFunc_offset_reg)
-                    outmips << "sw " << load_para_reg << ", " << para_offset << "(" << curFunc_offset_reg<< ")" <<  endl;
+                    //outmips << "TIPS: storing argument into function corresponding addr " << endl;
+                    outmips << "sw " << load_para_reg << ", " << para_offset << "(" << target_sp<< ")" <<  endl;
+                    
                 }// 装载参数完毕,记得清空此次调用的push_vector!!
                 // 只能清空倒数 para_table 个！不能全都清空
                 for (int i = 0; i < para_table.size(); i++) {
                     push_vector.pop_back(); // 这玩意儿做成一个栈会好一点
                 }
-                // sp = sp - func_offset -4 - 4,获得新的栈顶
-                // -4 是为了存 $ra, 再 -4 是为了存 curFuncOffset
-                //string curFunc_offset_reg = getReg();
-                outmips << "lw " << curFunc_offset_reg << ", curFuncOffset" << endl;
-                outmips << "addi " << curFunc_offset_reg << ", " << curFunc_offset_reg << ", -8" << endl;
-                // 获得sp即将移动的大小
-                outmips << "add $sp, $sp, " << curFunc_offset_reg << endl; // 移动 sp 成功
-                // jal name +"_" 记得加下划线
+                // sp 移动目标函数偏移 放到 函数头去完成
                 outmips << "jal " << target_function << "_" << endl;
-                //outmips << "nop" << endl;
+                // 回来的时候 sp 已经移动好了, 恢复 a1-a3寄存器
+                restoreA1();
             }
             else if (result == "ret") { // ret res , ret #t4 (说明返回语句是return(<表达式>) 这个样子)
                 //读到第一次生成中间代码 ret 的时候实际上还没有读到过 call
                 // 把右侧返回值(arg1) load 到 return_reg 里面
                 string return_reg = getReg();
                 if (arg1 != "") {
-                    load_argument(arg1, return_reg); // 把 #tx/idenfr 计算结果装到这个寄存器return_reg里
-                    // move $v1, $return_reg, 约定返回值都放在 $v1当中，
-                    //下一句就是 xxx = ret，会用到 two_elem_assign(result, arg1); 直接从 move xxx, $v1
-                    // 如果是无返回值函数，下一句也不会有 xxx = ret，不会用到 $v1，这里无所谓
+                    return_reg = load_argument(arg1, return_reg);
                     outmips << "move $v1, " << return_reg << endl;
                 }
                 // 然后,取出 4($sp) 得到 $ra, 取出 0($sp)的得到应该恢复的 sp, 然后 $jr ra
-                outmips << "lw $ra, 4($sp)" << endl;
-                string restore_sp = getReg();
-                outmips << "lw " << restore_sp << ", 0($sp)" << endl; // 得到的是一个负数，所以 sp = sp-restore
-                // curFuncOffset没有及时恢复，在jr $ra之前恢复
-                // 应该取 当前 0($sp)+8 即可得到上层函数的总体偏移，再把这个值存回curFuncOffset
-                string tmp_0_sp_plus8 = getReg();
-                outmips << "lw " << tmp_0_sp_plus8 << ", 0($sp)" << endl;
-                outmips << "addi " << tmp_0_sp_plus8 << ", "<< tmp_0_sp_plus8 << ", 8" << endl;
-                outmips << "sw " << tmp_0_sp_plus8 << ", curFuncOffset" << endl;
+                outmips << "lw $ra, 0($sp)" << endl;
                 
                 if (curFunc != "main") {
                     //最后移动sp, 注意，如果是main函数有return;语句 不要再跳了！
-                    outmips << "sub $sp, $sp, " << restore_sp << endl; // 恢复（上移）$sp
+                    int restore_sp = Func_attr[curFunc].getFuncSpOffset();
+                    outmips << "addi $sp, $sp, " << restore_sp << endl; // 恢复（上移）$sp
                     outmips << "jr $ra" << endl;
-                    //outmips << "nop" << endl;
                 } else { // main 函数中任何一个地方有return
                     outmips << "li $v0, 10" << endl;
                     outmips << "syscall" << endl;
-                    
                 }
             }
             else { // y = ret
@@ -2101,96 +2166,67 @@ void genMips(){
             // 要移动 真实的 $sp ???
             // 分配的工作都已经在生成中间代码的时候完成了，这里的mips好像不用生成什么东西
         }
-        else if (code.type == 5) { // 条件赋值到临时变量, arg1 必然是 #开头的！直接去vars_addr找就可以了
-            // #t8 i GRE 0 // t8 <- ( i >= 0)
-            // #t9 condition , 条件比较对象不会有char类型， 尚未考虑有数组元元素比较
-            string condition_res = getReg(); // $11,用来存条件真假结果的寄存器
+        else if (code.type == 5) { // 条件的是非结果中间变量只是放到寄存器里，不会存到内存里
+            // #t8 i GRE 0
+            string condition_res = getReg(); // 用来存条件真假结果的寄存器
             // if arg1 == 1, reg = 1, else reg = 0
+            // condition result 已经设置好
+             p++; // 最后再p++，这样下一句就不会再跳一遍 code.type == 3的情况了
+             midCode nextcode = getNextMidCode(p); // 肯定是跳转语句
+             string label = nextcode.op.substr(0, nextcode.op.size()-1);
+            
             if (op == "" && arg2 == "") { // 条件只有一个表达式的
-                if (vars_addr.count(arg1) == 1) { // lw condition_temp_reg, vars_addr[arg1]($sp)
-                    outmips << "lw " << condition_res << ", " << vars_addr[arg1] << "($sp)" << endl;
-                } else if (int_cons_value.count(arg1) == 1) {
-                    outmips << "li " << condition_res << ", " << int_cons_value[arg1] << endl;
-                } else if (global_vars.count(arg1) == 1) { // 全局变量直接用名字当地址
-                    outmips << "lw " << condition_res << ", " << arg1 << endl;
-                } else if (global_int_cons_value.count(arg1) == 1) { // 全局常量
-                    outmips << "li " << condition_res << ", " << global_int_cons_value[arg1] << endl;
-                } else if (arg1[0] == '+' || arg1[0] == '-' || isdigit(arg1[0])){
-                    int num = stoi(arg1);
-                    outmips << "li " << condition_res << ", " << num << endl;
-                } else if (arg1.find("[")) { // 有数组元素，应该会已经交给中间变量处理了？
-                    
+                condition_res = load_argument(arg1, condition_res);
+                if (nextcode.result == "BZ") { // 为假跳转, cond == 0
+                    outmips << "beqz " << condition_res << ", " << label << endl;
+                } else if (nextcode.result == "BNZ") { // 为真跳转 cond != 0
+                    outmips << "bnez " << condition_res << ", " << label << endl;
                 }
-                else {
-                    cout << "条件表达式不允许出现 int 以外的类型 " << endl;
-                }
-                
             }
             else { // 需要比较两个表达式, 先分别load好 tmp_reg1, tmp_reg2后续比较这两个寄存器
                 string tmp_reg1 = getReg(), tmp_reg2 = getReg();
-                if (vars_addr.count(arg1) == 1) { // lw condition_temp_reg, vars_addr[arg1]($sp)
-                    outmips << "lw " << tmp_reg1 << ", " << vars_addr[arg1] << "($sp)" << endl;
-                } else if (int_cons_value.count(arg1) == 1) {
-                    outmips << "li " << tmp_reg1 << ", " << int_cons_value[arg1] << endl;
-                } else if (global_vars.count(arg1) == 1) {
-                    outmips << "lw " << tmp_reg1 << ", " << arg1 << endl;
-                } else if (global_int_cons_value.count(arg1) == 1) { // 全局常量
-                    outmips << "li " << tmp_reg1 << ", " << global_int_cons_value[arg1] << endl;
-                } else if (arg1[0] == '+' || arg1[0] == '-' || isdigit(arg1[0])){
-                    int num = stoi(arg1);
-                    outmips << "li " << tmp_reg1 << ", " << num << endl;
-                } else if (arg1.find("[")) { // 有数组元素
-                    
-                }
-                else {
-                    cout << "条件表达式比较的前者不允许出现 int 以外的类型 " << endl;
-                }
-                
-                if (vars_addr.count(arg2) == 1) { // lw condition_temp_reg, vars_addr[arg1]($sp)
-                    outmips << "lw " << tmp_reg2 << ", " << vars_addr[arg2] << "($sp)" << endl;
-                } else if (int_cons_value.count(arg2) == 1) {
-                    outmips << "li " << tmp_reg2 << ", " << int_cons_value[arg2] << endl;
-                } else if (global_vars.count(arg2) == 1) {
-                    outmips << "lw " << tmp_reg2 << ", " << arg2 << endl;
-                } else if (global_int_cons_value.count(arg2) == 1) { // 全局常量
-                    outmips << "li " << tmp_reg2 << ", " << global_int_cons_value[arg2] << endl;
-                } else if (arg2[0] == '+' || arg2[0] == '-' || isdigit(arg2[0])){
-                    int num = stoi(arg2);
-                    outmips << "li " << tmp_reg2 << ", " << num << endl;
-                } else if (arg2.find("[")) { // 有数组元素
-                    
-                }
-                else {
-                    cout << "条件表达式比较的前者不允许出现 int 以外的类型 " << endl;
-                }
-
-                if (op == LSS) { // < set less than
-                    outmips << "slt " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
-                } else if (op == LEQ) { // <= set less or equal
-                    outmips << "sle " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
-                } else if (op == GRE) { // > set greater than
-                    outmips << "sgt " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
-                } else if (op == GEQ) { // >= set greater or equal
-                    outmips << "sge " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
-                } else if (op == EQL) { // == set equal
-                    outmips << "seq " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
-                } else if (op == NEQ) { // != set not equal
-                    outmips << "sne " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
+                tmp_reg1 = load_argument(arg1, tmp_reg1);
+                tmp_reg2 = load_argument(arg2, tmp_reg2);
+                outmips << "sub " << condition_res << ", " << tmp_reg1 << ", " << tmp_reg2 << endl;
+                // 相减然后比较与 0 的关系
+                if (op == LSS) { // a < b
+                    if (nextcode.result == "BZ") { // 为假跳转, a >=b
+                        outmips << "bgez " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 a < b
+                        outmips << "bltz " << condition_res << ", " << label << endl;
+                    }
+                } else if (op == LEQ) { // a <= b
+                    if (nextcode.result == "BZ") { // 为假跳转，a > b,
+                        outmips << "bgtz " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 a <= b
+                        outmips << "blez " << condition_res << ", " << label << endl;
+                    }
+                } else if (op == GRE) { // a > b ,
+                    if (nextcode.result == "BZ") { // 为假跳转，a <= b
+                        outmips << "blez " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 a > b
+                        outmips << "bgtz " << condition_res << ", " << label << endl;
+                    }
+                } else if (op == GEQ) { //a >= b set greater or equal
+                    if (nextcode.result == "BZ") { // 为假跳转，a < b
+                        outmips << "bltz " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 a > =b
+                        outmips << "bgez " << condition_res << ", " << label << endl;
+                    }
+                } else if (op == EQL) { // a == b, set equal
+                    if (nextcode.result == "BZ") { // 为假跳转，a != b
+                        outmips << "bnez " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 a == b
+                        outmips << "beqz " << condition_res << ", " << label << endl;
+                    }
+                } else if (op == NEQ) { // a != b, set not equal
+                    if (nextcode.result == "BZ") { //为假跳转，a ==b
+                        outmips << "beqz " << condition_res << ", " << label << endl;
+                    } else if (nextcode.result == "BNZ") { // 为真跳转 not equal to zero
+                        outmips << "bnez " << condition_res << ", " << label << endl;
+                    }
                 }
             }
-            // condition result 已经设置好
-            p++; // 最后再p++，这样下一句就不会再跳一遍 code.type == 3的情况了
-            midCode nextcode = getNextMidCode(p); // 肯定是跳转语句
-            string label = nextcode.op.substr(0, nextcode.op.size()-1);
-            // nextcode type = 3 的 arg1好像没有什么用，可以减少一次存取, 跳转到的标签不能带冒号
-            if (nextcode.result == "BZ") { // // branch if zero , false 为假跳转，// BZ #t1 label:
-                outmips << "beqz " << condition_res << ", " << label << endl;
-            } else if (nextcode.result == "BNZ") { // 为真跳转 not equal to zero
-                outmips << "bnez " << condition_res << ", " << label << endl;
-            } else {
-                cout << "条件的下一句不是 BZ BNZ 跳转指令" << endl;
-            }
-            //outmips << "nop" << endl;
         }
         else if (code.type == 6) { // 四元式， printf 语句，
             //后面表达式一旦有函数调用或者数组都会转化成 #tx中间变量，所以不用考虑
@@ -2202,7 +2238,6 @@ void genMips(){
                 outmips << "syscall" << endl;
             }
             if (arg2 != "") { // 输出表达式：op 代表后面表达式是不是 "char", arg2是后面的表达式exp若为 "" 则不输出
-                int addr2;
                 string reg2 = getReg();
                 if (op == "char") { // 字符型, 否则是int,  op == "NULL"或别的东西
                     if (arg2[0] == '\'') { // 输出字符print character， $v0 == 11, $a0 <- ASCII码
@@ -2213,42 +2248,15 @@ void genMips(){
                         outmips << "syscall" << endl;
                     }
                     else { // 字符，全局变量，全局常量
-                        if (vars_addr.count(arg2) == 1) { // 局部变量
-                            addr2 = vars_addr[arg2]; // 有可能是常量
-                            outmips << "lw " << reg2 << ", " << addr2 << "($sp)" << endl;
-                        } else if (char_cons_value.count(arg2) == 1) { // 局部char 常量
-                            int ascii = char_cons_value[arg2];
-                            outmips << "li " << reg2 << ", " << ascii << endl;
-                        } else if (global_vars.count(arg2) == 1) { // 全局变量,名字代表地址
-                            outmips << "lw " << reg2 << ", " << arg2 << endl;
-                        } else if (global_char_cons_value.count(arg2) == 1) { // 全局 char 常量
-                            int ascii = global_char_cons_value[arg2];
-                            outmips << "li " << reg2 << ", " << ascii << endl;
-                        } else if (arg2 == "ret") { // 函数调用返回值,call 完 返回值存在 $v1里
-                            // 大胆猜测：会不会有变量名叫 "ret"
-                            outmips << "move " << reg2 << ", $v1" << endl;
-                        }
+                        reg2 = load_argument(arg2, reg2);  // 往 reg2 里装载东西
                         outmips << "li $v0, 11" << endl; // 打印服务
+                        
                         outmips << "move " << "$a0, " << reg2 << endl;
                         outmips << "syscall" << endl;
                     }
                 }
                 else { // 表达式是整型的, 后面应该是一个 标识符名字， 或者 中间变量 #tx, var_addr获得地址取值
-                    if (vars_addr.count(arg2) == 1) { // 局部变量
-                        addr2 = vars_addr[arg2];
-                        outmips << "lw " << reg2 << ", " << addr2 << "($sp)" << endl;
-                    } else if (int_cons_value.count(arg2) == 1) { // 局部 int 常量
-                        outmips << "li " << reg2 << ", " << int_cons_value[arg2] << endl;
-                    } else if (global_vars.count(arg2) == 1) { // 全局变量
-                        outmips << "lw " << reg2 << ", " << arg2 << endl;
-                    } else if (global_int_cons_value.count(arg2) == 1) { // 全局 int 常量
-                        outmips << "li " << reg2 << ", " << global_int_cons_value[arg2] << endl;
-                    } else if (arg2[0] == '+' || arg2[0] == '-' || isdigit(arg2[0])) { // 有可能是一个整数
-                        int num = stoi(arg2); // 打印表达式直接是一个整数
-                        outmips << "li " << reg2 << ", " << num << endl;
-                    } else if (arg2 == "ret") { // 函数调用返回值,call 完 返回值存在 $v1里
-                        outmips << "move " << reg2 << ", $v1" << endl;
-                    }
+                    reg2 = load_argument(arg2, reg2);
                     // reg2装载完毕，下面调用打印服务
                     outmips << "li $v0, 1" << endl;
                     outmips << "move " << "$a0, " << reg2 << endl;
@@ -2260,8 +2268,8 @@ void genMips(){
             outmips << "la $a0, enter" << endl;
             outmips << "syscall" << endl;
         }
-        else if (code.type == 7) { // 二元式，scanf语句
-            // result == "scanf", arg1 == "int" , "char", op = idenfr
+        else if (code.type == 7) { // 二元式，scanf语句, op 不可能是中间变量
+            // result == "scanf", arg1 == "int" / "char", op = idenfr
             int addr = 0;
             if (result != "scanf") { cout << "type == 7 result != scanf 生成中间代码出错" << endl; }
             // scanf 进来的一定是全局变量或者局部变量，且不可能是数组元素
@@ -2283,14 +2291,31 @@ void genMips(){
             } else {
                 cout << "scanf 类型错误, 中间代码装进来的 不是 int | char " << endl;
             }
-            if (is_global_var) {
+            if (!is_global_var) {
+                // 是局部变量
+                // 先考虑会不会是归纳变量，且不能是参数
+                if (concludeVarMap.count(op) == 1 && func_attr.findArgumentPos(op) == 0) {
+                    string conclude_reg = concludeVarMap[op];
+                    outmips << "move " << conclude_reg << ", $v0" << endl;
+                } else {
+                    outmips << "sw $v0, " << addr << "($sp)" << endl;
+                }
+            }
+            else { // 局部变量，相对于($sp)的地址, $sp就是 cur_real_sp的值
                 outmips << "sw $v0, " << op << endl; // 用全局变量名当地址
-            } else { // 局部变量，相对于($sp)的地址, $sp就是 cur_real_sp的值
-                outmips << "sw $v0, " << addr << "($sp)" << endl;
             }
         }
         else if (code.type == 8) { // 一元，标签，各种labels
             outmips << result << endl;
+            if (result[0] == 'f') { // 进入 for 循环
+                if (inForLoop) {
+                    cout << "for 循环的结束 " << endl;
+                    inForLoop = false;
+                } else {
+                    cout << "发现了 for 循环的开始 " << endl;
+                    inForLoop = true;
+                }
+            }
         }
         // 看下一句是不是一个新的函数定义而本句不是"ret", 即无返回值函数的最后一句
         if (p < size - 1) { // 注意不要越界
@@ -2299,21 +2324,13 @@ void genMips(){
             if (nextmidCode.type == 2) {
                 if (nresult == "int" || nresult == "char" || nresult == "void") { //下一句是新的函数定义
                     if (code.result != "ret" && code.type != 4) { // 本句不是返回语句,也不是各种声明
-                        // 取出 4($sp) 得到 $ra, 取出 0($sp)的得到应该恢复的 sp, 然后 $jr ra
-                        outmips << "lw $ra, 4($sp)" << endl;
-                        string restore_sp = getReg();
-                        outmips << "lw " << restore_sp << ", 0($sp)" << endl; // 得到的是一个负数，所以 sp = sp-restore
-                        // curFuncOffset没有及时恢复，在jr $ra之前恢复
-                        // 应该取 当前 0($sp)+8 即可得到上层函数的总体偏移，再把这个值存回curFuncOffset
-                        string tmp_0_sp_plus8 = getReg();
-                        outmips << "lw " << tmp_0_sp_plus8 << ", 0($sp)" << endl;
-                        outmips << "addi " << tmp_0_sp_plus8 << ", "<< tmp_0_sp_plus8 << ", 8" << endl;
-                        outmips << "sw " << tmp_0_sp_plus8 << ", curFuncOffset" << endl;
+                        // 取出 0($sp) 得到 $ra
+                        outmips << "lw $ra, 0($sp)" << endl;
+                        int restore_sp = Func_attr[curFunc].getFuncSpOffset();
                         
                         // 最后再移动 sp !!!
-                        outmips << "sub $sp, $sp, " << restore_sp << endl; // 恢复（上移）$sp
+                        outmips << "addi $sp, $sp, " << restore_sp << endl; // 恢复（上移）$sp
                         outmips << "jr $ra" << endl;
-                        //outmips << "nop" << endl;
                     }
                 }
             }
@@ -2323,14 +2340,32 @@ void genMips(){
     }
     outmips.close();
 }
-
-string getReg(){ // regNo
+string getReg(string lockMid){ // regNo, 这里只返回临时寄存器，只能用 $t0 ~ $t9
     string ret = "";
-    ret = "$" + to_string(regNo); // $9开始
-    regNo++;
-    if (regNo > 15) {
-        regNo = 9; // t1 ~ t9
+    int cnt = 0;  // 这里可能会导致死循环
+    // 如果需要锁定的值，存在 $s0- s7中，一共8个
+    if (lockMid != "") {    //
+        while(saveRegisterGroup[sregNo] == 1) {  // 这个寄存器被占用了
+            sregNo++;                        // 换下一个寄存器
+            sregNo = sregNo % 8; // s0-s7
+            cnt++;
+        }
+        ret = "$s" + to_string(sregNo); // $s
+        lockedRegMap.insert(make_pair(lockMid, sregNo));
+        saveRegisterGroup[sregNo] = 1;  // 锁定，在下一次用它的时候解锁
+    } else { // t0-t7, t8, t9 扔一个没被占用的回去
+        while (tmpRegisterGroup[tregNo] == 1) {
+            tregNo++;
+            tregNo = tregNo % 10;
+        }
+        // 得到一个没被占用的 $t 寄存器
+        ret = "$t" + to_string(tregNo);
     }
+    sregNo++;
+    sregNo = sregNo % 8; // s0-s7
+    
+    tregNo++;
+    tregNo = tregNo % 10; //t0-t9
     return ret;
 }
 
@@ -2338,13 +2373,14 @@ void two_elem_assign(string result, string arg1) {
     map<string, int> int_cons_value = Func_attr[curFunc].int_cons_value;
     map<string, char> char_cons_value = Func_attr[curFunc].char_cons_value;
     map<string, int> vars_addr = Func_attr[curFunc].vars_addr;
+    Func_attribute func_attr = Func_attr[curFunc];
     int addr_res = 0; // result 有可能是数组
     bool index_is_mid = false;
     string res_offset, res_addr_reg; // res_addr_reg 后者用来存要赋给 result 的真实地址
     bool result_is_global = false, result_is_arr_elem = false;
     string result_index = "", result_arr = "";
-    if (vars_addr.count(result) == 1) { // 局部单个变量（含中间变量）
-        addr_res = vars_addr[result];
+    if (vars_addr.count(result) == 1) { // 局部单个变量（含中间变量, 参数）
+        addr_res = vars_addr[result]; // 如果是不经过内存的中间变量/参数，这句话其实用不到
     }
     else if (global_vars.count(result) == 1) { // 找全局变量
         result_is_global = true; // 全局单个变量
@@ -2358,9 +2394,23 @@ void two_elem_assign(string result, string arg1) {
         if (vars_addr.count(index) == 1) { // index是一个(中间)变量, 那么(中间)变量必然是局部的，直接vars_addr即可
             index_is_mid = true; // 是数组且下标index是(中间变量名)
             int mid_var_addr = vars_addr[index]; // 下标变量地址
-            res_offset = getReg(); // 临时存，中间变量结果
-            outmips << "lw " << res_offset <<", "<< mid_var_addr << "($sp)" << endl; // 中间变量数>0
-            outmips << "mul " << res_offset << ", " << res_offset << ", 4" << endl; // 数组内部真实偏移量
+            res_offset = getReg(); // 临时存，*4 后的结果
+            string mul_4 = getReg(); // 准备要在上面乘4
+            if (lockedRegMap.count(index) == 1) { // 中间变量在下标这里被用到，需要释放
+                int sregNo = lockedRegMap[index];
+                mul_4 = "$s" + to_string(sregNo);
+                lockedRegMap.erase(index);
+                saveRegisterGroup[sregNo] = 0;
+            }
+            else if (concludeVarMap.count(index) == 1 && func_attr.findArgumentPos(index) == 0) {
+                mul_4 = concludeVarMap[index];  // 直接从表里取出key对应的value就是寄存器名
+            }
+            else {
+                outmips << "lw " << mul_4 <<", "<< mid_var_addr << "($sp)" << endl; // 中间变量数>0
+            }
+            
+            // 下标如果是用某个寄存器取出来不能改动
+            outmips << "sll " << res_offset  << ", " << mul_4 << ", 2" << endl; // *4 = 左移两位
             res_addr_reg = getReg(); // 先存数组头地址
             // 应该先判断是不是局部的！！！
             if (vars_addr.count(arr_name) == 1){ // 左侧是局部数组， index 是(中间)局部变量 #t1， i， t
@@ -2375,7 +2425,7 @@ void two_elem_assign(string result, string arg1) {
             }
         }
         else if (int_cons_value.count(index) == 1) { // index 是局部常量名
-            index_is_mid = true;
+            // index_is_mid = true;
             if (vars_addr.count(arr_name) == 1) {
                 cout << "找到该局部数组 " << arr_name << " addd_res = "<< addr_res <<endl;
                 addr_res = vars_addr[arr_name]; // 数组首地址
@@ -2394,7 +2444,7 @@ void two_elem_assign(string result, string arg1) {
             
         }
         else if (global_int_cons_value.count(index) == 1){ // index是全局int 常量名
-            index_is_mid = true;
+            //index_is_mid = true;
             if (vars_addr.count(arr_name) == 1) { // 先找局部数组
                 cout << "找到该局部数组 " << arr_name << " addd_res = "<< addr_res <<endl;
                 addr_res = vars_addr[arr_name]; // 数组首地址
@@ -2415,7 +2465,7 @@ void two_elem_assign(string result, string arg1) {
             index_is_mid = true;
             res_offset = getReg(); // 临时存，下标乘 4
             outmips << "lw " << res_offset << ", " << index << endl; // 取下标值，index是全局变量名
-            outmips << "mul " << res_offset << ", " << res_offset << ", 4" << endl; //数组内部真实偏移量
+            outmips << "sll " << res_offset << ", " << res_offset << ", 2" << endl; // 左移两位
             res_addr_reg = getReg(); // 先存数组头地址
             if (vars_addr.count(arr_name) == 1) { // 看是否是局部数组
                 // 找数组首地址，最后会加上 res_offset
@@ -2431,7 +2481,7 @@ void two_elem_assign(string result, string arg1) {
             }
             
         }
-        else { // 是数组，且下标index是整数？还有没有其他可能
+        else { // 是数组，且下标index是整数
             cout << arr_name << " 赋值给数组下标 必然是整数！result_index = " << index << endl;
             if (vars_addr.count(arr_name) == 1){ // 局部数组 arr[2]
                 addr_res = vars_addr[arr_name]; // 数组首地址
@@ -2449,14 +2499,15 @@ void two_elem_assign(string result, string arg1) {
     
     string reg = getReg(); // 接下来在 reg 装好要存的值
     // load arg
-    load_argument(arg1, reg);
+    reg = load_argument(arg1, reg);
     // 现在 reg 里面存好了要赋的值，需要sw reg 到 result 代表的内存空间里
     
     if (result_is_global) { // 全局变量, 直接用 result_arr标签寻址
         if (result_is_arr_elem) { // 全局数组
             if (index_is_mid) { // 赋值给的result 的数组下标是一个中间变量或者 idenfr
+                //outmips << "TIPS: result is global , arr_elem, index is mid " << endl;
                 outmips << "sw " << reg << ", " << result_arr << "(" << res_offset << ")" << endl;
-            } else { // 全局数组，下标 是整数, sw $reg, result_arr+index
+            } else { // 全局数组，下标 是整数,局部常量，全局常量 sw $reg, result_arr+index
                 int real_int_index = 0;
                 real_int_index = stoi(result_index); // 去掉了 try catch
                 real_int_index = real_int_index*4;
@@ -2468,30 +2519,62 @@ void two_elem_assign(string result, string arg1) {
     }
     else { // 局部
         if (result_is_arr_elem) { // 局部数组
-            if (index_is_mid) { // 左侧是局部数组且下标 #t1或 idenfr
+            if (index_is_mid) { // 左侧是局部数组且下标 #t1或 变量的 idenfr 要在上面直接计算完，寄存器存地址
+                //outmips << "TIPS: result is NOT global, is arr_elem, index is mid " << endl;
                 outmips << "sw " << reg << ", (" << res_addr_reg << ")" << endl;
-            } else { // 局部数组，下标 是整数
+            } else { // 局部数组，下标 是整数, 局部常量，全局常量，直接找到相对地址
                 outmips << "sw " << reg << ", " << addr_res << "($sp)" << endl;
             }
-        } else { // 局部普通单个变量, 也要用到 addr_res， addr_res = vars_addr[result];
-            outmips << "sw " << reg << ", " << addr_res << "($sp)" << endl;
+        }
+        else { // 局部普通单个变量, 也要用到 addr_res， addr_res = vars_addr[result];
+            // 如果是中间变量，存临时寄存器，不要sw
+            if (result[0] == '#' && arg1 != "ret") { // 分配并锁定该寄存器
+                string allocReg = getReg(result);   // 把 reg 值存到 allocReg 里
+                outmips << "move " << allocReg << ", " << reg << endl;
+            } else if (concludeVarMap.count(result) == 1 && func_attr.findArgumentPos(result) == 0) {
+                outmips << "move " << concludeVarMap[result] << ", " << reg << endl;
+                // 赋值给归纳变量
+            }
+            else {
+                // cout << "赋值：这个中间变量还是要存到内存里 " << result << endl;
+                outmips << "sw " << reg << ", " << addr_res << "($sp)" << endl;
+            }   // 函数返回值还是要放到内存里面存取一下
+            
         }
     }
-    
 }
 
-void load_argument(string arg1, string reg) { // arg1是要被装的东西：整数，变量名，常量名，reg是要装的寄存器
+string load_argument(string arg1, string reg, bool unlock) { // unlock 默认为true arg1是要被装的东西：整数，变量名，常量名，reg是要装的寄存器
     map<string, int> int_cons_value = Func_attr[curFunc].int_cons_value;
     map<string, char> char_cons_value = Func_attr[curFunc].char_cons_value;
     map<string, int> vars_addr = Func_attr[curFunc].vars_addr;
+    Func_attribute func_attr = Func_attr[curFunc];
+    
     // arg 是当前函数的（中间）变量名？局部常量名/局部数组元素/全局变量名/全局数组元素/全局常量名/整数/字符
     // 要把现在参数的值存到 reg 里
     int addr_arg = 0; // arg1 有可能是数组
     string arg_offset;
-    //cout << "装载值 " << arg1 << endl;
-    if (isdigit(arg1[0]) || arg1[0] == '+' || arg1[0] == '-') { // 要把一个整数赋值给
+
+    // 优化：增加一条判断，这里的(中间)变量名字是不是与某个寄存器绑定在一起了，如果是，那么直接拿寄存器来用
+    if (lockedRegMap.count(arg1) == 1) { // 直接取出装有 arg1 的寄存器号拼接成
+        int sregNo = lockedRegMap[arg1];   // 取出来的是sregNo
+        string regForRet = "$s" + to_string(sregNo);    // 解锁仅仅与 $s0 至 $s7有关
+        // 解锁两步操作（有两侧函数调用时，不能马上解锁）
+        if (unlock) {   // 默认都是 true
+            lockedRegMap.erase(arg1);
+            saveRegisterGroup[sregNo] = 0;
+            cout << "释放 " << regForRet << ", 配对 " << arg1 << endl;
+        }
+        return regForRet;
+    }
+    
+    // 后考虑是不是归纳变量
+    if (concludeVarMap.count(arg1) == 1 && func_attr.findArgumentPos(arg1) == 0) {
+        return concludeVarMap[arg1];    // 返回归纳变量的寄存器名
+    }
+    
+    if (isInteger(arg1)) { // 要把一个整数赋值给
         int number = stoi(arg1);
-        cout << "load argument is an integer " << reg <<" "  <<arg1 << endl;
         outmips << "li " << reg << ", " << number << endl;
     }
     else if (arg1[0] == '\'') { // 被赋值的是一个字符
@@ -2523,7 +2606,6 @@ void load_argument(string arg1, string reg) { // arg1是要被装的东西：整
     }
     else if (arg1 == "ret") {
         // 赋值右侧是 return value
-        cout << "赋值右侧是 return value" << endl;
         outmips << "move " << reg << ", $v1" << endl; // 约定函数返回值都放在 $v1寄存器中
     }
     else if (arg1.find("[") > 0) {
@@ -2532,16 +2614,31 @@ void load_argument(string arg1, string reg) { // arg1是要被装的东西：整
         index = index.substr(0, index.size()-1); //
         cout << arr_name << "右侧 数组下标 index = " << index << " 赋值给左侧变量"<< endl;
         if (vars_addr.count(index) == 1) { // 右侧数组下标是局部(中间)变量 xx = num[#t2]
-            int mid_var_index = vars_addr[index]; // 得到存中间变量的内存地址
-            arg_offset = getReg(); // lw arg_offset, mid_var_index($sp)
-            outmips << "lw " << arg_offset << ", " << mid_var_index << "($sp)" << endl;
-            outmips << "mul " << arg_offset << ", " << arg_offset << ", 4" << endl; // 下标*4
+            int mid_var_index = vars_addr[index]; // 得到存变量的内存地址
+            arg_offset = getReg(); // *4 的结果
+            string mul_4 = getReg(); // 准备乘4
+            if (lockedRegMap.count(index) == 1) { // 这个下标是 #tx，已经存在一个 $s 寄存器里，需要释放
+                int sregNo = lockedRegMap[index];
+                mul_4 = "$s" + to_string(sregNo); // 直接用这个寄存器
+                lockedRegMap.erase(index);
+                saveRegisterGroup[sregNo] = 0;  // 释放
+            }
+            else if (concludeVarMap.count(index) == 1 && func_attr.findArgumentPos(index) == 0) {
+                mul_4 = concludeVarMap[index];  // 先考虑参数寄存器
+            }
+            else {
+                outmips << "lw " << mul_4 << ", " << mid_var_index << "($sp)" << endl;
+            }
+            
+            //然后再进行 下标*4, 左移2位
+            outmips << "sll " << arg_offset << ", " << mul_4 << ", 2" << endl;
             if (vars_addr.count(arr_name)){ // 右侧是局部数组,  下标是(中间)局部变量
                 addr_arg = vars_addr[arr_name]; // 局部数组相对于本函数的首地址
                 string tmp_arg1_addr_reg = getReg(); // 用来存数组头地址
                 outmips << "li " << tmp_arg1_addr_reg << ", " << addr_arg << endl;
                 outmips << "add " << tmp_arg1_addr_reg << ", " << tmp_arg1_addr_reg << ", " << arg_offset << endl;
                 // 上面得到 右侧数组元素 实际偏移地址大小，一个负整数，数组是往上长的，加offset正数
+                //outmips << "TIPS: 右侧数组元素 实际偏移地址大小，一个负整数，数组是往上长的，加offset正数" << endl;
                 outmips << "add " << tmp_arg1_addr_reg << ", " << tmp_arg1_addr_reg << ", $sp" << endl;
                 outmips << "lw " << reg << ", (" << tmp_arg1_addr_reg << ")" << endl;
                 // 把右侧要赋值的数装载到 reg 里就完事儿了
@@ -2581,7 +2678,7 @@ void load_argument(string arg1, string reg) { // arg1是要被装的东西：整
         else if (global_vars.count(index) == 1) { // index 下标是全局变量
             arg_offset = getReg();
             outmips << "lw " << arg_offset << ", " << index << endl; // 直接用全局变量名字取地址取值
-            outmips << "mul " << arg_offset << ", " << arg_offset << ", 4" << endl; // 下标*4
+            outmips << "sll " << arg_offset << ", " << arg_offset << ", 2" << endl; // 下标*4
             if (vars_addr.count(arr_name)){
                 addr_arg = vars_addr[arr_name]; // 局部数组相对于本函数的首地址，$sp时刻代表当前函数的起始位置
                 string tmp_arg1_addr_reg = getReg(); // 用来存数组头地址
@@ -2613,4 +2710,64 @@ void load_argument(string arg1, string reg) { // arg1是要被装的东西：整
     { // 如果 arg1 == "" 不做任何处理
         cout << "type = 2 midCode 无法二元赋值" << endl;
     }
+    return reg;
+}
+
+
+bool isInteger(string str){
+    if (str[0] == '+' || str[0] == '-' || isdigit(str[0])) {
+        return true;
+    } else return false;
+}
+
+void storeA1() {
+    string store_a = getReg(); // store_a是一个虚拟的位置标记寄存器，并未真正移动$sp
+    outmips << "addi " << store_a << ", $sp, -52" << endl;  // 3*4 用来存原来是12位
+    // 要存 $s0-$s9
+    for (int i = 0; i <= 7; i++) { // $s0-$s7
+        if (saveRegisterGroup[i] == 1) { // 被占用了，那么要保存现场
+            outmips << "sw $s" << i << ", " << i*4 << "(" << store_a << ")" << endl;
+        }
+    }
+    // 0,4, ..., 28
+    // 32, 36, 40, 44, 48, 52
+    for (int i = 0; i < concludeVarMap.size(); i++) { // 0~4 ,
+        outmips << "sw $t" << i << ", " << 32+4*i << "(" << store_a << ")" << endl;
+    }
+}
+void restoreA1() {
+
+    for (int i = 0; i <= 7; i++) { // $s0-$s7
+        if (saveRegisterGroup[i] == 1) { // 被占用了，那么要保存现场
+            outmips << "lw $s" << i << ", " << i*4 << "($sp)" << endl;
+        }
+    }
+    for (int i = 0; i < concludeVarMap.size(); i++) { // 0~4 ,
+        outmips << "lw $t" << i << ", " << 32+4*i << "($sp)" << endl;
+    }
+    
+    outmips << "addi $sp, $sp, 52" << endl;
+}
+
+int isPowerOf2(string num) {
+    // 传进来的是 数字字符串
+    if (isInteger(num)) {
+        int tmp = stoi(num);
+        if (tmp == 2) {
+            return 1;
+        } else if (tmp == 4) {
+            return 2;
+        } else if (tmp == 8) {
+            return 3;
+        } else if (tmp == 16) {
+            return 4;
+        } else if (tmp == 32) {
+            return 5;
+        } else if (tmp == 64) {
+            return 6;
+        } else if (tmp == 128) {
+            return 7;
+        } else return 0;
+    }
+    return 0; // 如果返回的是 0，说明不是2的幂
 }

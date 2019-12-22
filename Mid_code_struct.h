@@ -1,6 +1,6 @@
 //
 //  Mid_code_struct.h
-//  解耦合_代码生成
+//  代码生成
 //
 //  Created by 王珊珊 on 2019/11/14.
 //  Copyright © 2019 vanellope. All rights reserved.
@@ -57,5 +57,5 @@ string getCurTempReg();
 string getLastTempReg();
 int midCodeSize();
 midCode getNextMidCode(int i);
-
+void modifyMidCode(midCode code, int pos);
 #endif /* Mid_code_struct_h */
